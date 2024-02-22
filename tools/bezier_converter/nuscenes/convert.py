@@ -1,13 +1,17 @@
-import os
 import argparse
+import os
+import time
+from multiprocessing import Process, Value
+
 import numpy as np
-from tqdm import tqdm
-from nuscenes import NuScenes
 from pyquaternion import Quaternion
 from torch.utils.data import Dataset
+from tqdm import tqdm
+
+from nuscenes import NuScenes
 from rasterize import RasterizedLocalMap
 from vectorize import VectorizedLocalMap
-from multiprocessing import Pool, Value
+
 
 class NuScenesDataset(Dataset):
     def __init__(
@@ -100,49 +104,89 @@ class NuScenesSemanticDataset(NuScenesDataset):
         )
 
 
-def process_dataset(save_dir, dataset, idx):
-    file_path = os.path.join(save_dir, dataset.nusc.sample[idx]["token"] + ".npz")
-    if os.path.exists(file_path):
-        return
-    item = dataset.__getitem__(idx)
-    np.savez_compressed(
-        file_path,
-        image_paths=np.array(item[0]),
-        trans=item[1],
-        rots=item[2],
-        intrins=item[3],
-        semantic_mask=item[4][0],
-        instance_mask=item[5][0],
-        instance_mask8=item[5][1],
-        ego_vectors=item[6],
-        map_vectors=item[7],
-        ctr_points=item[8],
+def process_dataset(args, ids, progress):
+    dataset = NuScenesSemanticDataset(
+        args._version,
+        args.data_root,
+        args.xbound,
+        args.ybound,
+        args.thickness,
+        args.num_degrees,
+        max_channel=args.n_classes,
     )
 
+    print(f"Processing {len(ids)} samples")
+
+    for i in ids:
+        file_path = os.path.join(args.save_dir, dataset.nusc.sample[i]["token"] + ".npz")
+
+        if not os.path.exists(file_path):
+            item = dataset.__getitem__(i)
+            np.savez_compressed(
+                file_path,
+                image_paths=np.array(item[0]),
+                trans=item[1],
+                rots=item[2],
+                intrins=item[3],
+                semantic_mask=item[4][0],
+                instance_mask=item[5][0],
+                instance_mask8=item[5][1],
+                ego_vectors=item[6],
+                map_vectors=item[7],
+                ctr_points=item[8],
+            )
+
+        progress.value += 1
+
+
 def main():
-    parser = argparse.ArgumentParser(description='Bezier GT Generator.')
-    parser.add_argument('-d', '--data_root', type=str, default='./data')
-    parser.add_argument('-n', '--data_name', type=str, default='bemapnet')
-    parser.add_argument('-v', '--version', nargs='+', type=str, default=['v1.0-test', 'v1.0-trainval'])
-    parser.add_argument("--num_degrees", nargs='+', type=int, default=[2, 1, 3])
-    parser.add_argument("--thickness", nargs='+', type=int, default=[1, 8])
+    parser = argparse.ArgumentParser(description="Bezier GT Generator.")
+    parser.add_argument("-d", "--data_root", type=str, default="./data")
+    parser.add_argument("-n", "--data_name", type=str, default="bemapnet")
+    parser.add_argument(
+        "-v", "--version", nargs="+", type=str, default=["v1.0-test", "v1.0-trainval"]
+    )
+    parser.add_argument("--num_degrees", nargs="+", type=int, default=[2, 1, 3])
+    parser.add_argument("--thickness", nargs="+", type=int, default=[1, 8])
     parser.add_argument("--xbound", nargs=3, type=float, default=[-30.0, 30.0, 0.15])
     parser.add_argument("--ybound", nargs=3, type=float, default=[-15.0, 15.0, 0.15])
     args = parser.parse_args()
 
-    n_classes = len(args.num_degrees)  # 0 --> divider(d=2),  1 --> crossing(d=1),  2--> contour(d=3)
-    save_dir = os.path.join(args.data_root, 'customer', args.data_name)
-    os.makedirs(save_dir, exist_ok=True)
+    args.n_classes = len(args.num_degrees) # 0 --> divider(d=2),  1 --> crossing(d=1),  2--> contour(d=3)
+    args.save_dir = os.path.join(args.data_root, "customer", args.data_name)
+    os.makedirs(args.save_dir, exist_ok=True)
 
     for version in args.version:
-        dataset = NuScenesSemanticDataset(
-            version, args.data_root, args.xbound, args.ybound, args.thickness, args.num_degrees, max_channel=n_classes)
-        
         print(f"Processing {version} dataset")
-        
-        with Pool(os.cpu_count()) as pool, tqdm(total=len(dataset), desc="Processing") as pbar:
-            for _ in pool.imap_unordered(process_dataset, [save_dir, dataset, idx for idx in range(len(dataset))]):
-                pbar.update(1)
 
-if __name__ == '__main__':
+        args._version = version
+        lenght = len(
+            NuScenes(version=version, dataroot=args.data_root, verbose=False).sample
+        )
+        progress = Value("i", 0)
+
+        # Create n_cpu workers
+        n_workers = os.cpu_count() - 1
+        workers = []
+        for i in range(n_workers):
+            ids = list(range(i, lenght, n_workers))
+            p = Process(target=process_dataset, args=(args, ids, progress))
+            workers.append(p)
+            p.start()
+
+        # Get progress from workers
+        with tqdm(total=lenght) as pbar:
+            while True:
+                with progress.get_lock():
+                    if progress.value >= lenght:
+                        break
+                    print(progress.value, pbar.n)
+                    pbar.update(progress.value - pbar.n)                 
+                    if any(not w.is_alive() for w in workers):
+                        raise ValueError(f"One or more workers died unexpectedly with exit code {[w.exitcode for w in workers if not w.is_alive()]}")
+                pbar.refresh()
+                time.sleep(1)
+
+
+if __name__ == "__main__":
     main()
