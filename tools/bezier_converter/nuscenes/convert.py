@@ -141,7 +141,7 @@ def main():
         print(f"Processing {version} dataset")
         
         with Pool(os.cpu_count()) as pool, tqdm(total=len(dataset), desc="Processing") as pbar:
-            for _ in pool.imap_unordered(process_dataset, [save_dir] * len(dataset), [dataset] * len(dataset), range(len(dataset))):
+            for _ in pool.imap_unordered(process_dataset, [save_dir, dataset, idx for idx in range(len(dataset))]):
                 pbar.update(1)
 
 if __name__ == '__main__':
